@@ -1,0 +1,76 @@
+name: Publish H2O Lightning 4B weights
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Hugging Face revision (main is resolved to exact commit SHA)
+        type: string
+        required: true
+        default: main
+      tag:
+        description: GitHub Release tag
+        type: string
+        required: true
+        default: h2o-lightning-4b-v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: h2o-lightning-weights-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install streaming publisher dependencies
+        run: python -m pip install --disable-pip-version-check 'huggingface_hub>=0.30,<2' 'requests>=2.32,<3'
+      - name: Test chunking, recovery, and resume
+        run: python -m unittest discover -s tests -v
+      - name: Find existing draft or create new draft Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          sys.path.insert(0, "scripts")
+          from stream_release import find_release
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+          release = find_release(repo, tag)
+          if release is not None:
+              if not release.get("draft"):
+                  raise SystemExit("Release is already published; refusing overwrite")
+              print(f"Resuming draft {tag} ({len(release.get('assets', []))} assets)")
+          else:
+              subprocess.run([
+                  "gh", "release", "create", tag, "--draft",
+                  "--target", os.environ["GITHUB_SHA"], "--repo", repo,
+                  "--title", "H2O Lightning 4B model mirror",
+                  "--notes", "Unmodified upstream snapshot: https://huggingface.co/h2oai/h2o-lightning-4b. Source commit and SHA256 checksums in manifest.json. Preserve upstream license and notices."
+              ], check=True)
+          PY
+      - name: Stream upstream snapshot into GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          REVISION: ${{ inputs.revision }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python scripts/stream_release.py \
+            --repo h2oai/h2o-lightning-4b \
+            --revision "$REVISION" \
+            --out dist --chunk-mib 1024 \
+            --release-tag "$TAG"
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
